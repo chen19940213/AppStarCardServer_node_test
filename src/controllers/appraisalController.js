@@ -1,5 +1,6 @@
 const pool = require('../config/database');
 const Response = require('../utils/response');
+const QwenService = require('../services/qwenService');
 
 class AppraisalController {
   // 创建鉴定记录
@@ -11,25 +12,91 @@ class AppraisalController {
         return Response.error(res, '缺少图片URL', -1, 400);
       }
 
-      // 模拟AI鉴定结果
-      const mockResults = ['符合正品特征', '疑似仿品', '需要进一步鉴定'];
-      const result = mockResults[Math.floor(Math.random() * mockResults.length)];
+      // 支持单个图片URL或图片数组
+      const imageArray = Array.isArray(card_image) ? card_image : [card_image];
+      
+      if (imageArray.length === 0) {
+        return Response.error(res, '图片数组不能为空', -1, 400);
+      }
 
-      const [insertResult] = await pool.query(
-        'INSERT INTO appraisals (user_id, card_name, card_image, status, result) VALUES (?, ?, ?, ?, ?)',
-        [req.user.userId, card_name || '未命名卡片', card_image, status, result]
-      );
+      console.log(`🔍 开始调用千问AI进行图片鉴定，共 ${imageArray.length} 张图片（一次性提交）...`);
+      
+      // 一次性提交所有图片给AI进行综合判断
+      let aiResult;
+      try {
+        aiResult = await QwenService.judgeImages(imageArray);
+        console.log('✅ 千问AI批量鉴定完成:', aiResult);
+      } catch (error) {
+        console.error('❌ 千问AI批量调用失败:', error.message);
+        // AI调用失败时，使用备用结果
+        aiResult = {
+          isBeautiful: false,
+          score: 0,
+          comment: 'AI鉴定服务暂时不可用，请稍后重试',
+          images_detail: imageArray.map((url, i) => ({
+            image_index: i + 1,
+            image_url: url,
+            score: 0,
+            comment: '鉴定失败'
+          }))
+        };
+      }
+
+      // 处理AI返回的结果，补充图片URL
+      if (aiResult.images_detail && Array.isArray(aiResult.images_detail)) {
+        aiResult.images_detail = aiResult.images_detail.map((detail, i) => ({
+          ...detail,
+          image_url: imageArray[detail.image_index - 1] || imageArray[i] || ''
+        }));
+      } else if (imageArray.length > 1) {
+        // 如果AI没有返回详细结果，但有多张图片，创建一个默认的详细结果
+        aiResult.images_detail = imageArray.map((url, i) => ({
+          image_index: i + 1,
+          image_url: url,
+          score: aiResult.score,
+          comment: `图片${i + 1}: ${aiResult.comment.split('；')[i] || aiResult.comment}`
+        }));
+      }
+
+      // 生成鉴定结果描述
+      const avgScore = aiResult.score || 0;
+      const allBeautiful = aiResult.isBeautiful || false;
+      const overallComment = aiResult.comment || '无评价';
+      
+      const result = allBeautiful 
+        ? `所有图片质量优秀（评分：${avgScore}分）- ${overallComment}`
+        : `图片质量${avgScore >= 70 ? '良好' : '一般'}（评分：${avgScore}分）- ${overallComment}`;
+
+      // 保存鉴定结果到数据库（如果有用户信息则保存，否则user_id设为null）
+      // const userId = req.user?.userId || null;
+      // const imageUrlsString = Array.isArray(card_image) ? JSON.stringify(card_image) : card_image;
+      // const [insertResult] = await pool.query(
+      //   'INSERT INTO appraisals (user_id, card_name, card_image, status, result) VALUES (?, ?, ?, ?, ?)',
+      //   [userId, card_name || '未命名卡片', imageUrlsString, status, result]
+      // );
 
       return Response.success(res, {
-        id: insertResult.insertId,
+        // id: insertResult.insertId,
         card_name: card_name || '未命名卡片',
-        card_image,
+        card_image: imageArray, // 统一返回数组格式
         status,
-        result
+        result,
+        ai_judgment: {
+          isBeautiful: aiResult.isBeautiful || false,
+          score: aiResult.score || 0,
+          comment: aiResult.comment || '无评价',
+          total_images: imageArray.length,
+          images_detail: aiResult.images_detail || imageArray.map((url, i) => ({
+            image_index: i + 1,
+            image_url: url,
+            score: aiResult.score || 0,
+            comment: aiResult.comment || '无评价'
+          }))
+        }
       }, '鉴定成功');
     } catch (error) {
       console.error('创建鉴定记录失败:', error);
-      return Response.error(res, '鉴定失败');
+      return Response.error(res, '鉴定失败: ' + error.message, -1, 500);
     }
   }
 
